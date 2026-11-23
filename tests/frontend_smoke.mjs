@@ -46,21 +46,31 @@ globalThis.clearTimeout = () => {};
 
 const calls = [];
 let responses = [];
+let deferred = [];
 globalThis.fetch = async (path, options) => {
   calls.push({ path, body: options && options.body ? JSON.parse(options.body) : null });
   const next = responses.shift();
   if (!next) throw new Error(`no canned response for ${path}`);
+  if (next.deferred) {
+    // 延迟响应：由测试决定完成顺序，用于模拟旧响应晚到。
+    return await new Promise((resolve) => { deferred.push({ next, resolve }); });
+  }
+  return makeResponse(next);
+};
+
+function makeResponse(next) {
   return {
     ok: next.status ? next.status < 400 : true,
     status: next.status || 200,
     json: async () => next.body,
   };
-};
+}
 
 const byId = (id) => elements.get(id);
 const settle = () => new Promise((resolve) => setImmediate(resolve));
 
 const snapshot = (overrides = {}) => ({
+  seq: 0,
   config: { public_ip: "203.0.113.10", port_min: 40000, port_max: 40001, size: 2, label: "203.0.113.10:40000-40001" },
   clock: { now: 0, label: "T+00:00:00", cooldown_seconds: 60 },
   connections: [],
@@ -174,10 +184,91 @@ await settle();
 assert(byId("log").children[0].innerHTML.includes("NO_PORT_AVAILABLE") || byId("log").children[0].innerHTML.includes("耗尽"), "耗尽写入日志");
 
 // 7. 推进时钟：读取 body.result.expired_cooldowns。
-responses.push({ body: { snapshot: snapshot({ clock: { now: 60, label: "T+00:01:00", cooldown_seconds: 60 } }), result: { advanced_seconds: 60, now: 60, now_label: "T+00:01:00", expired_cooldowns: 1 } } });
+responses.push({ body: { snapshot: snapshot({ seq: 4, clock: { now: 60, label: "T+00:01:00", cooldown_seconds: 60 } }), result: { advanced_seconds: 60, now: 60, now_label: "T+00:01:00", expired_cooldowns: 1 } } });
 byId("advance-seconds").value = "60";
 await byId("advance-btn").handlers.click();
 await settle();
 assert(byId("clock").textContent.includes("T+00:01:00"), "时钟渲染");
+
+// 8. 两页并行：推进时钟（seq 10）的响应先回，旧建连快照（seq 9）后到。
+//    旧响应不得把时钟/连接表退回旧值，但日志仍按该操作发生时的演练时刻记。
+const oldConn = { ...connection, id: 9, public: { ip: "203.0.113.10", port: 40001, label: "203.0.113.10:40001" } };
+responses.push({
+  deferred: true,
+  body: {
+    snapshot: snapshot({ seq: 9, clock: { now: 120, label: "T+00:02:00", cooldown_seconds: 60 }, connections: [oldConn], summary: { active_connections: 1, cooldowns: 0, upstreams: 1 } }),
+    result: oldConn,
+  },
+});
+const staleConnect = byId("connect-form").handlers.submit({ preventDefault() {} });
+await settle();
+assert(deferred.length === 1, "建连响应已挂起");
+responses.push({ body: { snapshot: snapshot({ seq: 10, clock: { now: 180, label: "T+00:03:00", cooldown_seconds: 60 } }), result: { advanced_seconds: 60, now: 180, now_label: "T+00:03:00", expired_cooldowns: 0 } } });
+byId("advance-seconds").value = "60";
+await byId("advance-btn").handlers.click();
+await settle();
+assert(byId("clock").textContent.includes("T+00:03:00"), "推进响应先到，时钟前进");
+
+const pending = deferred.shift();
+pending.resolve(makeResponse(pending.next));
+await staleConnect;
+await settle();
+assert(byId("clock").textContent.includes("T+00:03:00"), "旧建连响应晚到不回退时钟");
+assert(!byId("connections").innerHTML.includes("#9"), "旧建连响应晚到不回填连接表");
+assert(byId("reply-public-port").value !== "40001", "过时的建连响应不回填回包表单");
+assert(byId("log").children[0].innerHTML.includes("T+00:02:00"), "旧响应日志按操作发生时的演练时刻记录");
+
+// 9. 同一演练秒内两个建连响应乱序：后发出的响应先回，页面与回包表单
+//    都必须采用服务端执行顺序更靠后的那次（seq 更大），不按到达顺序。
+const firstConnect = { ...connection, id: 11, public: { ip: "203.0.113.10", port: 40000, label: "203.0.113.10:40000" } };
+const secondConnect = { ...connection, id: 12, public: { ip: "203.0.113.10", port: 40001, label: "203.0.113.10:40001" } };
+responses.push({
+  deferred: true,
+  body: {
+    snapshot: snapshot({ seq: 20, clock: { now: 180, label: "T+00:03:00", cooldown_seconds: 60 }, connections: [firstConnect], summary: { active_connections: 1, cooldowns: 0, upstreams: 1 } }),
+    result: firstConnect,
+  },
+});
+const staleSameSecond = byId("connect-form").handlers.submit({ preventDefault() {} });
+await settle();
+responses.push({
+  body: {
+    snapshot: snapshot({ seq: 21, clock: { now: 180, label: "T+00:03:00", cooldown_seconds: 60 }, connections: [firstConnect, secondConnect], summary: { active_connections: 2, cooldowns: 0, upstreams: 1 } }),
+    result: secondConnect,
+  },
+});
+await byId("connect-form").handlers.submit({ preventDefault() {} });
+await settle();
+assert(String(byId("reply-public-port").value) === "40001", "同秒后执行的建连先回填端口");
+
+const pendingSameSecond = deferred.shift();
+pendingSameSecond.resolve(makeResponse(pendingSameSecond.next));
+await staleSameSecond;
+await settle();
+assert(String(byId("reply-public-port").value) === "40001", "同秒旧建连晚到不回填回包表单");
+assert(byId("connections").innerHTML.includes("#12"), "同秒旧建连晚到不回退连接表");
+assert(byId("clock").textContent.includes("T+00:03:00"), "同秒乱序后时钟不变");
+
+// 10. 回包判定为冷却丢弃：快照仍是判定时的状态（含冷却记录）。
+responses.push({
+  body: {
+    snapshot: snapshot({
+      seq: 22, clock: { now: 180, label: "T+00:03:00", cooldown_seconds: 60 },
+      cooldowns: [{ public: connection.public, public_port: 40000, upstream: connection.upstream, internal: connection.internal, connection_id: 7, closed_at: 0, closed_at_label: "T+00:00:00", cooldown_until: 240, cooldown_until_label: "T+00:04:00", remaining_seconds: 30 }],
+      summary: { active_connections: 0, cooldowns: 1, upstreams: 1 },
+    }),
+    result: {
+      outcome: "dropped", reason_code: "COOLDOWN_LATE",
+      reason: "公网端口 40000 与原上游 198.51.100.7:443 的映射仍在冷却（剩余 30 秒），迟包已丢弃",
+      remaining_seconds: 30, original_internal: connection.internal,
+      public: { ip: "203.0.113.10", port: 40000, label: "203.0.113.10:40000" },
+      upstream: connection.upstream, at: 180, at_label: "T+00:03:00",
+    },
+  },
+});
+await byId("reply-form").handlers.submit({ preventDefault() {} });
+await settle();
+assert(byId("cooldowns").innerHTML.includes("203.0.113.10:40000"), "冷却丢弃时快照仍含该冷却记录");
+assert(byId("reply-result").innerHTML.includes("COOLDOWN_LATE"), "冷却丢弃原因显示");
 
 console.log(process.exitCode ? "frontend smoke: FAILED" : "frontend smoke: OK");

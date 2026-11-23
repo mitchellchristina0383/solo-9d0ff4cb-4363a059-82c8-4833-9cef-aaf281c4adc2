@@ -53,7 +53,15 @@ gunicorn --bind 127.0.0.1:8000 --workers 1 --threads 8 wsgi:app
 | POST | `/api/replies` | `upstream_ip/upstream_port/public_port` 模拟回包 |
 
 变更类接口返回 `{"snapshot": ..., "result": ...}`；业务错误返回 4xx +
-`{"error": {"code", "message", "details"}}`。
+`{"error": {"code", "message", "details", "at", "at_label"}}`。
+
+快照里有 `seq`（写操作执行序号）：快照与操作在同一把状态锁内生成，因此
+`snapshot` 就是该操作完成时的状态，`seq` 就是该操作的先后次序。多个页面
+并行操作时，页面只采纳序号不小于已渲染序号的快照——晚到的旧响应不会把
+时钟、连接表、冷却表退回旧值；同一演练秒内的多个操作也按服务端执行顺序
+分先后。回包接口的 `snapshot` 即判定时的状态：判为 `COOLDOWN_LATE` 时，
+快照里一定还能看到那条冷却记录。旧响应仍会照常把操作结果写进日志，并按
+响应里的 `at_label`（操作发生时的演练时刻）标注时间。
 
 回包丢弃原因码：`COOLDOWN_LATE`、`UPSTREAM_MISMATCH`、`PORT_OUT_OF_RANGE`、
 `NO_MAPPING`。
@@ -61,8 +69,8 @@ gunicorn --bind 127.0.0.1:8000 --workers 1 --threads 8 wsgi:app
 ## 自测
 
 ```bash
-PYTHONPATH=. python3 -m unittest discover -s tests -v   # 后端 29 项
-node tests/frontend_smoke.mjs                          # 前端交互 17 项断言
+PYTHONPATH=. python3 -m unittest discover -s tests -v   # 后端 34 项
+node tests/frontend_smoke.mjs                          # 前端交互 30 项断言
 ```
 
 `tests/frontend_smoke.mjs` 用最小 DOM 桩加载页面里的真实脚本，按后端返回形状

@@ -344,11 +344,18 @@
   <script>
     "use strict";
 
-    const state = { snapshot: null };
+    // snapshot.seq 是服务端写操作序号：快照与操作在同一把状态锁内生成。
+    // 页面只渲染序号不小于已渲染序号的快照，晚到的旧响应不会把时钟、
+    // 连接表、冷却表退回旧值；同一演练秒内的多个操作也按服务端执行先后排序。
+    const state = { snapshot: null, seq: -1 };
     const $ = (id) => document.getElementById(id);
     const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (c) => ({
       "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
     }[c]));
+
+    function snapshotSeq(snapshot) {
+      return snapshot && typeof snapshot.seq === "number" ? snapshot.seq : null;
+    }
 
     let toastTimer = null;
     function toast(message) {
@@ -359,11 +366,12 @@
       toastTimer = setTimeout(() => el.classList.remove("show"), 4200);
     }
 
-    function log(message, tone) {
+    // atLabel 传操作发生时的演练时刻；旧响应晚到时不能借用当前显示的时钟。
+    function log(message, tone, atLabel) {
       const box = $("log");
       const entry = document.createElement("div");
       entry.className = "entry";
-      const now = state.snapshot ? state.snapshot.clock.label : "";
+      const now = atLabel || (state.snapshot ? state.snapshot.clock.label : "");
       entry.innerHTML = `<span class="t">${esc(now)}</span><span class="${esc(tone || "")}">${esc(message)}</span>`;
       box.prepend(entry);
       while (box.children.length > 200) box.removeChild(box.lastChild);
@@ -393,6 +401,8 @@
 
     function render(snapshot) {
       state.snapshot = snapshot;
+      const seq = snapshotSeq(snapshot);
+      if (seq !== null) state.seq = seq;
       const clock = snapshot.clock;
       $("clock").textContent = `演练时钟 ${clock.label}（${clock.now}s，冷却 ${clock.cooldown_seconds}s）`;
 
@@ -416,6 +426,15 @@
       renderUpstreams(snapshot);
       renderConnections(conns);
       renderCooldowns(snapshot.cooldowns);
+    }
+
+    // 只采纳序号不小于已渲染序号的快照；旧响应晚到时返回 false，
+    // 由调用方决定仍要展示的操作结果/日志（不回流到共享列表）。
+    function adopt(snapshot) {
+      const seq = snapshotSeq(snapshot);
+      if (seq !== null && seq < state.seq) return false;
+      render(snapshot);
+      return true;
     }
 
     function renderUpstreams(snapshot) {
@@ -524,23 +543,30 @@
 
     async function refresh() {
       try {
-        render(await api("/api/state"));
+        const snapshot = await api("/api/state");
+        const seq = snapshotSeq(snapshot);
+        // 轮询结果比已渲染的写操作更旧时（例如建连响应尚未到达）直接丢弃。
+        if (seq !== null && seq < state.seq) return;
+        adopt(snapshot);
       } catch (err) {
         toast(err.message);
       }
     }
 
+    // 写操作统一走这里：服务端已在锁内返回“操作完成时的快照”，
+    // 按序号采纳，旧响应不覆盖时钟/连接/冷却列表；body.accepted 表示该快照
+    // 是否仍是页面见过的最新状态（旧响应仍会返回，供日志按操作时刻记录）。
     async function guard(action, label) {
       try {
         const body = await action();
-        render(body.snapshot);
-        return body;
+        const accepted = adopt(body.snapshot);
+        return Object.assign(body, { accepted });
       } catch (err) {
         const detail = err.detail || {};
-        log(`${label}失败：${err.message}`, "bad");
+        log(`${label}失败：${err.message}`, "bad", detail.at_label);
         if (detail.code === "NO_PORT_AVAILABLE" && detail.details) {
           const d = detail.details;
-          log(`耗尽明细：上游 ${d.upstream.label}，在用 ${d.active_count} 个、冷却 ${d.cooling_count} 个，容量 ${d.capacity}（端口 ${d.port_min}-${d.port_max}）`, "warn");
+          log(`耗尽明细：上游 ${d.upstream.label}，在用 ${d.active_count} 个、冷却 ${d.cooling_count} 个，容量 ${d.capacity}（端口 ${d.port_min}-${d.port_max}）`, "warn", detail.at_label);
         }
         toast(err.message);
         throw err;
@@ -553,7 +579,7 @@
       try {
         const body = await guard(() => post("/api/config", payload), "应用公网配置");
         const config = body.snapshot.config;
-        log(`公网配置设为 ${config.public_ip}:${config.port_min}-${config.port_max}（${config.size} 个端口）`, "ok");
+        log(`公网配置设为 ${config.public_ip}:${config.port_min}-${config.port_max}（${config.size} 个端口）`, "ok", body.snapshot.clock.label);
         $("config-replace").checked = false;
       } catch (err) { /* 已提示 */ }
     });
@@ -562,14 +588,14 @@
       if (!confirm("确认清空所有活动连接和冷却记录？")) return;
       try {
         const body = await guard(() => post("/api/reset"), "清空演练数据");
-        log(`已清空演练数据：移除 ${body.result.removed} 条连接/冷却记录（保留公网配置与时钟）`, "warn");
+        log(`已清空演练数据：移除 ${body.result.removed} 条连接/冷却记录（保留公网配置与时钟）`, "warn", body.snapshot.clock.label);
       } catch (err) { /* 已提示 */ }
     });
 
     async function advance(seconds) {
       try {
         const body = await guard(() => post("/api/clock/advance", { seconds }), "推进演练时钟");
-        log(`演练时钟推进 ${seconds}s → ${body.snapshot.clock.label}；释放冷却 ${body.result.expired_cooldowns} 个组合`, "warn");
+        log(`演练时钟推进 ${seconds}s → ${body.snapshot.clock.label}；释放冷却 ${body.result.expired_cooldowns} 个组合`, "warn", body.result.now_label);
       } catch (err) { /* 已提示 */ }
     }
     document.querySelectorAll("[data-advance]").forEach((btn) => {
@@ -588,10 +614,14 @@
       try {
         const body = await guard(() => post("/api/connections", payload), "建立连接");
         const connection = body.result;
-        log(`连接 #${connection.id} ${connection.internal.label} → ${connection.upstream.label} 分配公网 ${connection.public.label}`, "ok");
-        $("reply-upstream-ip").value = connection.upstream.ip;
-        $("reply-upstream-port").value = connection.upstream.port;
-        $("reply-public-port").value = connection.public.port;
+        log(`连接 #${connection.id} ${connection.internal.label} → ${connection.upstream.label} 分配公网 ${connection.public.label}`, "ok", body.snapshot.clock.label);
+        // 回包表单只从尚未过时的建连响应取值：若页面上已渲染了更新的状态
+        // （accepted=false），这次响应已晚到，不回填，避免端口/上游被旧值覆盖。
+        if (body.accepted) {
+          $("reply-upstream-ip").value = connection.upstream.ip;
+          $("reply-upstream-port").value = connection.upstream.port;
+          $("reply-public-port").value = connection.public.port;
+        }
       } catch (err) { /* 已提示 */ }
     });
 
@@ -602,7 +632,7 @@
       try {
         const body = await guard(() => post(`/api/connections/${id}/close`), "关闭连接");
         const cooldown = body.result.cooldown;
-        log(`连接 #${cooldown.connection_id} 关闭；公网 ${cooldown.public_port} + 上游 ${cooldown.upstream.label} 冷却至 ${cooldown.cooldown_until_label}`, "warn");
+        log(`连接 #${cooldown.connection_id} 关闭；公网 ${cooldown.public_port} + 上游 ${cooldown.upstream.label} 冷却至 ${cooldown.cooldown_until_label}`, "warn", body.snapshot.clock.label);
       } catch (err) { /* 已提示 */ }
     });
 
@@ -615,13 +645,14 @@
       };
       try {
         const body = await post("/api/replies", payload);
-        render(body.snapshot);
+        // 回包快照是服务端判定时的状态；若已有更新的状态在页面上，不倒退。
+        adopt(body.snapshot);
         const result = body.result;
         renderReply(result);
         if (result.outcome === "delivered") {
-          log(`回包 上游 ${result.upstream.label} → 公网 ${result.public.port} 送达 ${result.internal.label}（连接 #${result.connection_id}）`, "ok");
+          log(`回包 上游 ${result.upstream.label} → 公网 ${result.public.port} 送达 ${result.internal.label}（连接 #${result.connection_id}）`, "ok", result.at_label);
         } else {
-          log(`回包 上游 ${result.upstream.label} → 公网 ${result.public.port} 丢弃：${result.reason_code} · ${result.reason}`, "bad");
+          log(`回包 上游 ${result.upstream.label} → 公网 ${result.public.port} 丢弃：${result.reason_code} · ${result.reason}`, "bad", result.at_label);
         }
       } catch (err) {
         renderReply({ outcome: "dropped", reason_code: "REQUEST_FAILED", reason: err.message, public: { label: "—" }, upstream: { label: "—" }, at_label: "" });

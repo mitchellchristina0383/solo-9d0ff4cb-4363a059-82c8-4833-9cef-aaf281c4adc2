@@ -413,6 +413,164 @@ class ApiTests(unittest.TestCase):
         state = self.client.get("/api/state").get_json()
         self.assertEqual(state["clock"]["cooldown_seconds"], 60)
 
+    def test_every_mutation_returns_snapshot_reflecting_its_own_operation(self):
+        created = self.post(
+            "/api/connections",
+            {
+                "internal_ip": "10.0.0.21",
+                "internal_port": 51515,
+                "upstream_ip": "198.51.100.7",
+                "upstream_port": 443,
+            },
+        ).get_json()
+        conn = created["result"]
+        closed = self.post(f"/api/connections/{conn['id']}/close", {}).get_json()
+        # 关闭响应里的快照必须已经包含刚产生的冷却记录。
+        self.assertEqual(
+            [item["public_port"] for item in closed["snapshot"]["cooldowns"]],
+            [conn["public"]["port"]],
+        )
+        self.assertEqual(closed["snapshot"]["summary"]["active_connections"], 0)
+
+        replied = self.post(
+            "/api/replies",
+            {"upstream_ip": "198.51.100.7", "upstream_port": 443, "public_port": conn["public"]["port"]},
+        ).get_json()
+        self.assertEqual(replied["result"]["reason_code"], "COOLDOWN_LATE")
+        # 回包快照与判定同刻：冷却记录仍在快照里，不会“判为冷却却查不到记录”。
+        self.assertEqual(
+            [item["public_port"] for item in replied["snapshot"]["cooldowns"]],
+            [conn["public"]["port"]],
+        )
+
+    def test_business_error_carries_operation_time(self):
+        self.post("/api/clock/advance", {"seconds": 7})
+        response = self.post(
+            "/api/connections",
+            {
+                "internal_ip": "10.0.0.21",
+                "internal_port": 51515,
+                "upstream_ip": "198.51.100.7",
+                "upstream_port": 443,
+            },
+        )
+        created = response.get_json()["result"]
+        self.post(f"/api/connections/{created['id']}/close", {})
+        self.post("/api/clock/advance", {"seconds": 3})
+
+        missing = self.post(f"/api/connections/{created['id']}/close", {})
+        self.assertEqual(missing.status_code, 404)
+        error = missing.get_json()["error"]
+        self.assertEqual(error["code"], "CONNECTION_NOT_FOUND")
+        self.assertEqual(error["at"], 10)
+        self.assertEqual(error["at_label"], "T+00:00:10")
+
+    def test_snapshot_seq_increases_by_one_per_write(self):
+        created = self.post(
+            "/api/connections",
+            {
+                "internal_ip": "10.0.0.21",
+                "internal_port": 51515,
+                "upstream_ip": "198.51.100.7",
+                "upstream_port": 443,
+            },
+        ).get_json()
+        first_seq = created["snapshot"]["seq"]
+        advanced = self.post("/api/clock/advance", {"seconds": 1}).get_json()
+        self.assertEqual(advanced["snapshot"]["seq"], first_seq + 1)
+        # 只读接口不推进序号，但仍返回当前序号。
+        self.assertEqual(self.client.get("/api/state").get_json()["seq"], first_seq + 1)
+
+    def test_snapshot_is_taken_under_the_same_lock_as_the_operation(self):
+        """快照必须与写操作同锁生成，否则两页并行时快照会漏掉本次操作。"""
+
+        table = make_table()
+        conn = open_conn(table)
+        observed = {}
+        original_close = table.close_connection
+
+        def probing_close(connection_id):
+            result = original_close(connection_id)
+            # 操作返回后，另开线程尝试拿状态锁：若快照还需要在同一事务里取，
+            # 锁此刻应仍被持有，探测线程拿不到。
+            acquired = []
+
+            def probe():
+                if table._lock.acquire(timeout=0.2):
+                    acquired.append(True)
+                    table._lock.release()
+                else:
+                    acquired.append(False)
+
+            worker = threading.Thread(target=probe)
+            worker.start()
+            worker.join()
+            observed["lock_still_held"] = acquired == [False]
+            return result
+
+        table.close_connection = probing_close  # type: ignore[method-assign]
+        try:
+            snapshot, result = table.transact(lambda: table.close_connection(conn["id"]))
+        finally:
+            table.close_connection = original_close  # type: ignore[method-assign]
+
+        self.assertTrue(observed["lock_still_held"], "操作返回后到取快照前仍应持有状态锁")
+        self.assertEqual(
+            [item["public_port"] for item in snapshot["cooldowns"]],
+            [conn["public"]["port"]],
+        )
+        self.assertEqual(result["cooldown"]["public_port"], conn["public"]["port"])
+
+    def test_concurrent_write_responses_never_show_stale_cooldowns(self):
+        """两页并行时，每个成功响应内的快照都必须与本次操作结果自洽。"""
+
+        created = self.post(
+            "/api/connections",
+            {
+                "internal_ip": "10.0.0.21",
+                "internal_port": 51515,
+                "upstream_ip": "198.51.100.7",
+                "upstream_port": 443,
+            },
+        ).get_json()
+        self.post(f"/api/connections/{created['result']['id']}/close", {})
+        replies = []
+
+        def reply_worker():
+            client = self.app.test_client()
+            for _ in range(15):
+                replies.append(
+                    client.post(
+                        "/api/replies",
+                        {"upstream_ip": "198.51.100.7", "upstream_port": 443, "public_port": 40000},
+                    ).get_json()
+                )
+
+        def advance_worker():
+            client = self.app.test_client()
+            for _ in range(15):
+                client.post("/api/clock/advance", {"seconds": 1})
+
+        threads = [threading.Thread(target=reply_worker), threading.Thread(target=advance_worker)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        for body in replies:
+            result = body["result"]
+            snapshot = body["snapshot"]
+            if result["reason_code"] == "COOLDOWN_LATE":
+                # 判为冷却丢弃时，随附快照必须是判定时的状态，仍含该冷却记录。
+                self.assertIn(
+                    result["public"]["port"],
+                    [item["public_port"] for item in snapshot["cooldowns"]],
+                )
+                self.assertEqual(snapshot["clock"]["now"], result["at"])
+
+        seqs = [body["snapshot"]["seq"] for body in replies]
+        self.assertEqual(len(seqs), len(set(seqs)), "每次写操作的快照序号必须唯一递增")
+
 
 if __name__ == "__main__":
     unittest.main()

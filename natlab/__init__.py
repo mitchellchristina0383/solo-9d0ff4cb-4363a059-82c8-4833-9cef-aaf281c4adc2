@@ -6,6 +6,8 @@ gunicorn worker（见 Dockerfile），避免多 worker 时各进程各有一张 
 API 约定：
 * GET  /api/state            → 快照
 * POST /api/*（变更类）       → {"snapshot": 快照, "result": 本次操作结果}
+  快照与操作在同一把状态锁内生成，即“该操作完成时的快照”；快照里的 seq
+  是该操作的执行序号，页面据此丢弃晚到的旧响应。
 * 业务错误                    → HTTP 4xx + {"error": {code, message, details}}
 """
 
@@ -68,10 +70,11 @@ def create_app(*, cooldown_seconds: int | None = None) -> Flask:
     table = NatTable(cooldown_seconds=cooldown_seconds)
     app.extensions["nat_table"] = table
 
-    def mutate(result: dict[str, Any]) -> dict[str, Any]:
-        """变更类接口统一返回“最新快照 + 本次操作结果”。"""
+    def mutate(action: Callable[[], dict[str, Any]]) -> dict[str, Any]:
+        """在状态锁内执行操作并取快照，确保快照就是该操作完成时的状态。"""
 
-        return {"snapshot": table.snapshot(), "result": result}
+        snapshot, result = table.transact(action)
+        return {"snapshot": snapshot, "result": result}
 
     @app.get("/")
     def index():
@@ -87,7 +90,7 @@ def create_app(*, cooldown_seconds: int | None = None) -> Flask:
     def post_config():
         body = _json_body()
         return mutate(
-            table.configure(
+            lambda: table.configure(
                 body.get("public_ip"),
                 body.get("port_min"),
                 body.get("port_max"),
@@ -98,19 +101,20 @@ def create_app(*, cooldown_seconds: int | None = None) -> Flask:
     @app.post("/api/reset")
     @_api
     def post_reset():
-        return mutate(table.reset())
+        return mutate(table.reset)
 
     @app.post("/api/clock/advance")
     @_api
     def post_advance():
-        return mutate(table.advance(_json_body().get("seconds")))
+        seconds = _json_body().get("seconds")
+        return mutate(lambda: table.advance(seconds))
 
     @app.post("/api/connections")
     @_api
     def post_connection():
         body = _json_body()
         return mutate(
-            table.open_connection(
+            lambda: table.open_connection(
                 body.get("internal_ip"),
                 body.get("internal_port"),
                 body.get("upstream_ip"),
@@ -121,14 +125,14 @@ def create_app(*, cooldown_seconds: int | None = None) -> Flask:
     @app.post("/api/connections/<connection_id>/close")
     @_api
     def post_close(connection_id: str):
-        return mutate(table.close_connection(connection_id))
+        return mutate(lambda: table.close_connection(connection_id))
 
     @app.post("/api/replies")
     @_api
     def post_reply():
         body = _json_body()
         return mutate(
-            table.simulate_reply(
+            lambda: table.simulate_reply(
                 body.get("upstream_ip"),
                 body.get("upstream_port"),
                 body.get("public_port"),

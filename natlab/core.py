@@ -16,7 +16,7 @@ from __future__ import annotations
 import ipaddress
 import threading
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 COOLDOWN_SECONDS = 60
 MIN_PORT = 1
@@ -56,9 +56,20 @@ class NatError(Exception):
         self.message = message
         self.status = status
         self.details = details or {}
+        # 业务错误发生时的演练时刻；由 NatTable 在锁内补上，便于页面把晚到的
+        # 失败响应按操作发生时刻记入日志。请求体本身不合法时保持 None。
+        self.at: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {"code": self.code, "message": self.message, "details": self.details}
+        payload: dict[str, Any] = {
+            "code": self.code,
+            "message": self.message,
+            "details": self.details,
+        }
+        if self.at is not None:
+            payload["at"] = self.at
+            payload["at_label"] = format_elapsed(self.at)
+        return payload
 
 
 def _is_ascii_digits(text: str) -> bool:
@@ -186,9 +197,35 @@ class NatTable:
         self._config: PublicConfig | None = None
         self._now = start_at
         self._seq = 0
+        # 操作序号：每个写操作在同一把锁内取号并完成状态变更，快照带上该序号。
+        # 页面据此只采纳序号更大的快照，避免旧响应晚到把列表/时钟退回旧值。
+        self._op_seq = 0
         self._connections: dict[int, Connection] = {}
         self._active_index: dict[tuple[int, Endpoint], int] = {}
         self._cooldowns: dict[tuple[int, Endpoint], Cooldown] = {}
+
+    # ------------------------------------------------------------------ 事务与快照
+
+    def transact(self, action: Callable[[], dict[str, Any]]) -> tuple[dict[str, Any], dict[str, Any]]:
+        """在同一把锁内执行写操作并取快照，返回 (快照, 本次操作结果)。
+
+        快照必须在锁内取：否则操作返回与取快照之间若插入另一页面的操作，
+        页面看到的“操作完成时快照”就会漏掉刚发生的变更（例如刚进入冷却的
+        记录），回包判为 COOLDOWN_LATE 时随附快照里却查不到那条冷却记录。
+        快照序号即操作序号，表示快照恰好反映该操作完成后的状态。
+        """
+
+        with self._lock:
+            try:
+                result = action()
+            except NatError as exc:
+                # 给业务错误补上操作发生时的演练时刻（锁内读数，避免被并发推进影响）。
+                if exc.at is None:
+                    exc.at = self._now
+                raise
+            self._op_seq += 1
+            snapshot = self._snapshot()
+            return snapshot, result
 
     # ------------------------------------------------------------------ 配置与时钟
 
@@ -479,7 +516,10 @@ class NatTable:
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
-            self._prune_expired()
+            if self._prune_expired():
+                # 读取时清掉过期冷却同样是状态变化（例如冷却时长为 0），
+                # 推进版本号，保证同一 seq 永远对应同一份状态。
+                self._op_seq += 1
             return self._snapshot()
 
     def _snapshot(self) -> dict[str, Any]:
@@ -527,6 +567,7 @@ class NatTable:
             )
 
         return {
+            "seq": self._op_seq,
             "config": config.to_dict() if config is not None else None,
             "clock": {
                 "now": self._now,
@@ -622,12 +663,15 @@ class NatTable:
             },
         )
 
-    def _prune_expired(self) -> None:
+    def _prune_expired(self) -> int:
+        """删除已到期冷却，返回删除条数。"""
+
         expired = [
             key for key, cooldown in self._cooldowns.items() if cooldown.until <= self._now
         ]
         for key in expired:
             del self._cooldowns[key]
+        return len(expired)
 
     def _has_state(self) -> bool:
         return bool(self._connections or self._cooldowns)
